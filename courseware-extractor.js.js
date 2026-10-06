@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         课件提取器 第11版-按钮外置+自动页数+AI整理指令
+// @name         课件提取器
 // @namespace    http://tampermonkey.net/
-// @version      11.0
+// @version      11.1
 // @description  按钮显示在外层网页右下角；自动探测课件总页数；导出文件开头附带交给AI整理笔记的指令
 // @match        *://outer.example.com/*
 // @match        *://deck.example.com/*
@@ -18,6 +18,7 @@
     // ===================== 外层网页(top)：负责按钮、进度、下载 =====================
     function initTop() {
         var btn = null, status = null, deckWin = null, deckOrigin = '*';
+        var progWrap = null, progText = null, progBar = null, startTime = 0, totalCache = 0;
 
         function ensureUI() {
             if (btn && document.body.contains(btn)) return;
@@ -35,6 +36,17 @@
             status.style.cssText = 'padding:8px 14px;background:rgba(0,0,0,.85);color:#fff;border-radius:6px;font-size:13px;display:none;max-width:320px;';
 
             box.appendChild(btn); box.appendChild(status);
+            progWrap = document.createElement('div');
+            progWrap.id = 'tm11-prog';
+            progWrap.style.cssText = 'display:none;margin-top:8px;font-size:12px;color:#374151;min-width:200px;';
+            progText = document.createElement('div');
+            progWrap.appendChild(progText);
+            var pbg = document.createElement('div');
+            pbg.style.cssText = 'width:100%;height:6px;background:#e5e7eb;border-radius:3px;margin-top:5px;overflow:hidden;';
+            progBar = document.createElement('div');
+            progBar.style.cssText = 'width:0%;height:6px;background:#22c55e;border-radius:3px;transition:width .25s;';
+            pbg.appendChild(progBar); progWrap.appendChild(pbg);
+            box.appendChild(progWrap);
             document.body.appendChild(box);
             btn.addEventListener('click', start);
         }
@@ -65,11 +77,23 @@
             if (!f) { show('❌ 没找到课件窗口，请先打开课件放映页'); return; }
             deckWin = f;
             btn.disabled = true; btn.textContent = '⏳ 提取中...';
+            startTime = Date.now(); totalCache = 0; setProgress(0, 0);
             show('已通知课件窗口，开始自动逐页提取...');
             send({ action: 'start' });
         }
 
         function show(t) { if (status) { status.style.display = 'block'; status.textContent = t; } }
+        function fmt(s) { s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60), ss = s % 60; return (m < 10 ? '0' : '') + m + ':' + (ss < 10 ? '0' : '') + ss; }
+        function setProgress(i, total) {
+            if (!progWrap) return;
+            progWrap.style.display = 'block';
+            var pct = total > 0 ? Math.round(i / total * 100) : 0;
+            if (progBar) progBar.style.width = pct + '%';
+            var el = (Date.now() - startTime) / 1000;
+            var extra = '已用时 ' + fmt(el);
+            if (total > 0 && i > 0) { extra += ' · 预计还需 ' + fmt((el / i) * (total - i)); }
+            if (progText) progText.textContent = (total > 0 ? ('已抓取 ' + i + ' / ' + total + ' 页') : ('已抓取 ' + i + ' 页')) + ' · ' + extra;
+        }
 
         function hideLater() { setTimeout(function () { if (status) status.style.display = 'none'; }, 8000); }
 
@@ -78,15 +102,24 @@
             if (!ev.data || ev.data.ch !== CH) return;
             var d = ev.data.data || {};
             if (d.action === 'total') {
+                totalCache = parseInt(d.total, 10) || 0;
                 show('检测到总页数：' + d.total + ' 页，正在逐页抓取...');
             } else if (d.action === 'progress') {
                 show('正在抓取第 ' + d.i + ' / ' + (d.total || '?') + ' 页...');
+                setProgress(d.i, parseInt(d.total, 10) || totalCache);
             } else if (d.action === 'done') {
-                show('✅ 提取完成，正在生成 Word...');
-                downloadWord(d.text, d.title);
-                btn.disabled = false; btn.textContent = '📚 提取课件正文';
-                show('✅ 已生成并下载，请查看浏览器下载列表');
-                hideLater();
+                if (progBar) progBar.style.width = '100%';
+                if (progText) progText.textContent = '✅ 抓取完成，正在生成 Word，请勿关闭页面…';
+                show('✅ 提取完成，正在生成 Word…（页数较多时可能需要一点时间，请勿关闭页面）');
+                setTimeout(function () {
+                    var g0 = Date.now();
+                    downloadWord(d.text, d.title);
+                    var gd = Math.round((Date.now() - g0) / 100) / 10;
+                    if (progText) progText.textContent = '✅ 已生成并下载（生成耗时 ' + gd + ' 秒），请查看浏览器下载列表';
+                    btn.disabled = false; btn.textContent = '📚 提取课件正文';
+                    show('✅ 已生成并下载，请查看浏览器下载列表');
+                    hideLater();
+                }, 40);
             } else if (d.action === 'error') {
                 show('❌ 出错：' + d.msg);
                 btn.disabled = false; btn.textContent = '📚 提取课件正文';
@@ -126,7 +159,8 @@
                 instr + '<hr>' + body +
                 '</body></html>';
 
-            var fname = '课件笔记_' + (title ? title.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '') : '提取版') + '_第11版.doc';
+            var totalPages = (rawText.match(/【第 \d+ 页】/g) || []).length || totalCache || '';
+            var fname = '课件笔记_' + (title ? title : '未识别章节') + '_共' + totalPages + '页.doc';
             var blob = new Blob(['\ufeff', html], { type: 'application/msword' });
             var url = URL.createObjectURL(blob);
             var a = document.createElement('a');
